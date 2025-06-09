@@ -10,11 +10,17 @@ import sys
 import tempfile
 import time
 from typing import Dict, Optional
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import traceback
 
 from openevolve.EvaluatorInterface import Evaluator
 from openevolve.config import EvaluatorConfig
 from openevolve.llm.ensemble import LLMEnsemble
 from openevolve.utils.async_utils import TaskPool, run_in_executor
+from openevolve.prompt.sampler import PromptSampler
+from openevolve.utils.format_utils import format_metrics_safe
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +38,13 @@ class EvaluatorPython(Evaluator):
         config: EvaluatorConfig,
         evaluation_file: str,
         llm_ensemble: Optional[LLMEnsemble] = None,
+        prompt_sampler: Optional[PromptSampler] = None,
     ):
         super().__init__(config)
         self.config = config
         self.evaluation_file = evaluation_file
         self.llm_ensemble = llm_ensemble
+        self.prompt_sampler = prompt_sampler
 
         # Create a task pool for parallel evaluation
         self.task_pool = TaskPool(max_concurrency=config.parallel_evaluations)
@@ -78,46 +86,61 @@ class EvaluatorPython(Evaluator):
     ) -> Dict[str, float]:
 
         start_time = time.time()
+        program_id_str = f" {program_id}" if program_id else ""
 
-        # Create a temporary file for the program
-        with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as temp_file:
-            temp_file.write(program_code.encode("utf-8"))
-            temp_file_path = temp_file.name
+        # Retry logic for evaluation
+        last_exception = None
+        for attempt in range(self.config.max_retries + 1):
+            # Create a temporary file for the program
+            with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as temp_file:
+                temp_file.write(program_code.encode("utf-8"))
+                temp_file_path = temp_file.name
 
-        try:
-            # Run evaluation
-            if self.config.cascade_evaluation:
-                # Run cascade evaluation
-                metrics = await self._cascade_evaluate(temp_file_path)
-            else:
-                # Run direct evaluation
-                metrics = await self._direct_evaluate(temp_file_path)
+            try:
+                # Run evaluation
+                if self.config.cascade_evaluation:
+                    # Run cascade evaluation
+                    metrics = await self._cascade_evaluate(temp_file_path)
+                else:
+                    # Run direct evaluation
+                    metrics = await self._direct_evaluate(temp_file_path)
 
-            # Add LLM feedback if configured
-            if self.config.use_llm_feedback and self.llm_ensemble:
-                feedback_metrics = await self._llm_evaluate(program_code)
+                # Add LLM feedback if configured
+                if self.config.use_llm_feedback and self.llm_ensemble:
+                    feedback_metrics = await self._llm_evaluate(program_code)
 
-                # Combine metrics
-                for name, value in feedback_metrics.items():
-                    metrics[f"llm_{name}"] = value * self.config.llm_feedback_weight
+                    # Combine metrics
+                    for name, value in feedback_metrics.items():
+                        metrics[f"llm_{name}"] = value * self.config.llm_feedback_weight
 
-            elapsed = time.time() - start_time
-            program_id_str = f" {program_id}" if program_id else ""
-            logger.info(
-                f"Evaluated program{program_id_str} in {elapsed:.2f}s: "
-                f"{', '.join(f'{name}={value:.4f}' for name, value in metrics.items())}"
-            )
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"Evaluated program{program_id_str} in {elapsed:.2f}s: "
+                    f"{format_metrics_safe(metrics)}"
+                )
 
-            return metrics
+                return metrics
 
-        except Exception as e:
-            logger.error(f"Error evaluating program: {str(e)}")
-            return {"error": 0.0}
+            except Exception as e:
+                last_exception = e
+                logger.warning(
+                    f"Evaluation attempt {attempt + 1}/{self.config.max_retries + 1} failed for program{program_id_str}: {str(e)}"
+                )
 
-        finally:
-            # Clean up temporary file
-            if os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
+                # If this is not the last attempt, wait a bit before retrying
+                if attempt < self.config.max_retries:
+                    await asyncio.sleep(1.0)  # Wait 1 second before retry
+
+            finally:
+                # Clean up temporary file
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
+
+        # All retries failed
+        logger.error(
+            f"All evaluation attempts failed for program{program_id_str}. Last error: {str(last_exception)}"
+        )
+        return {"error": 0.0}
 
     @run_in_executor
     def _direct_evaluate(self, program_path: str) -> Dict[str, float]:
@@ -259,30 +282,14 @@ class EvaluatorPython(Evaluator):
 
         try:
             # Create prompt for LLM
-            prompt = f"""
-            Evaluate the following code on a scale of 0.0 to 1.0 for the following metrics:
-            1. Readability: How easy is the code to read and understand?
-            2. Maintainability: How easy would the code be to maintain and modify?
-            3. Efficiency: How efficient is the code in terms of time and space complexity?
-            
-            For each metric, provide a score between 0.0 and 1.0, where 1.0 is best.
-            
-            Code to evaluate:
-            ```python
-            {program_code}
-            ```
-            
-            Return your evaluation as a JSON object with the following format:
-            {{
-                "readability": [score],
-                "maintainability": [score],
-                "efficiency": [score],
-                "reasoning": "[brief explanation of scores]"
-            }}
-            """
+            prompt = self.prompt_sampler.build_prompt(
+                current_program=program_code, template_key="evaluation"
+            )
 
             # Get LLM response
-            response = await self.llm_ensemble.generate(prompt)
+            responses = await self.llm_ensemble.generate_all_with_context(
+                prompt["system"], [{"role": "user", "content": prompt["user"]}]
+            )
 
             # Extract JSON from response
             try:
@@ -290,29 +297,42 @@ class EvaluatorPython(Evaluator):
                 json_pattern = r"```json\n(.*?)\n```"
                 import re
 
-                json_match = re.search(json_pattern, response, re.DOTALL)
+                avg_metrics = {}
+                for i, response in enumerate(responses):
+                    json_match = re.search(json_pattern, response, re.DOTALL)
 
-                if json_match:
-                    json_str = json_match.group(1)
-                else:
-                    # Try to extract JSON directly
-                    json_str = response
-                    # Remove non-JSON parts
-                    start_idx = json_str.find("{")
-                    end_idx = json_str.rfind("}") + 1
-                    if start_idx >= 0 and end_idx > start_idx:
-                        json_str = json_str[start_idx:end_idx]
+                    if json_match:
+                        json_str = json_match.group(1)
+                    else:
+                        # Try to extract JSON directly
+                        json_str = response
+                        # Remove non-JSON parts
+                        start_idx = json_str.find("{")
+                        end_idx = json_str.rfind("}") + 1
+                        if start_idx >= 0 and end_idx > start_idx:
+                            json_str = json_str[start_idx:end_idx]
 
-                # Parse JSON
-                result = json.loads(json_str)
+                    # Parse JSON
+                    result = json.loads(json_str)
 
-                # Extract metrics
-                metrics = {}
-                for key in ["readability", "maintainability", "efficiency"]:
-                    if key in result:
-                        metrics[key] = float(result[key])
+                    # Filter all non-numeric values
+                    metrics = {
+                        name: float(value)
+                        for name, value in result.items()
+                        if isinstance(value, (int, float))
+                    }
 
-                return metrics
+                    # Weight of the model in the ensemble
+                    weight = self.llm_ensemble.weights[i] if self.llm_ensemble.weights else 1.0
+
+                    # Average the metrics
+                    for name, value in metrics.items():
+                        if name in avg_metrics:
+                            avg_metrics[name] += value * weight
+                        else:
+                            avg_metrics[name] = value * weight
+
+                return avg_metrics
 
             except Exception as e:
                 logger.warning(f"Error parsing LLM response: {str(e)}")
@@ -320,6 +340,7 @@ class EvaluatorPython(Evaluator):
 
         except Exception as e:
             logger.error(f"Error in LLM evaluation: {str(e)}")
+            traceback.print_exc()
             return {}
 
     def _passes_threshold(self, metrics: Dict[str, float], threshold: float) -> bool:
