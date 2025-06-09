@@ -24,6 +24,10 @@ from openevolve.utils.code_utils import (
     parse_evolve_blocks,
     parse_full_rewrite,
 )
+from openevolve.utils.format_utils import (
+    format_metrics_safe,
+    format_improvement_safe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +71,15 @@ class OpenEvolve:
         # Set up logging
         self._setup_logging()
 
+        # Set random seed for reproducibility if specified
+        if self.config.random_seed is not None:
+            import random
+            import numpy as np
+
+            random.seed(self.config.random_seed)
+            np.random.seed(self.config.random_seed)
+            logger.info(f"Set random seed to {self.config.random_seed} for reproducibility")
+
         # Load initial program
         self.initial_program_path = initial_program_path
         self.initial_program_code = self._load_initial_program()
@@ -83,10 +96,25 @@ class OpenEvolve:
                 self.file_extension = f".{self.file_extension}"
 
         # Initialize components
-        self.llm_ensemble = LLMEnsemble(self.config.llm)
+        self.llm_ensemble = LLMEnsemble(self.config.llm.models)
+        self.llm_evaluator_ensemble = LLMEnsemble(self.config.llm.evaluator_models)
+
         self.prompt_sampler = PromptSampler(self.config.prompt)
+        self.evaluator_prompt_sampler = PromptSampler(self.config.prompt)
+        self.evaluator_prompt_sampler.set_templates("evaluator_system_message")
+
+        # Pass random seed to database if specified
+        if self.config.random_seed is not None:
+            self.config.database.random_seed = self.config.random_seed
+
         self.database = ProgramDatabase(self.config.database)
-        self.evaluator = EvaluatorPython(self.config.evaluator, evaluation_file, self.llm_ensemble)
+
+        self.evaluator = Evaluator(
+            self.config.evaluator,
+            evaluation_file,
+            self.llm_evaluator_ensemble,
+            self.evaluator_prompt_sampler,
+        )
 
         logger.info(f"Initialized OpenEvolve with {initial_program_path} " f"and {evaluation_file}")
 
@@ -179,10 +207,27 @@ class OpenEvolve:
             f"Starting evolution from iteration {start_iteration} for {max_iterations} iterations (total: {total_iterations})"
         )
 
+        # Island-based evolution variables
+        programs_per_island = max(
+            1, max_iterations // (self.config.database.num_islands * 10)
+        )  # Dynamic allocation
+        current_island_counter = 0
+
+        logger.info(f"Using island-based evolution with {self.config.database.num_islands} islands")
+        self.database.log_island_status()
+
         for i in range(start_iteration, total_iterations):
             iteration_start = time.time()
 
-            # Sample parent and inspirations
+            # Manage island evolution - switch islands periodically
+            if i > start_iteration and current_island_counter >= programs_per_island:
+                self.database.next_island()
+                current_island_counter = 0
+                logger.debug(f"Switched to island {self.database.current_island}")
+
+            current_island_counter += 1
+
+            # Sample parent and inspirations from current island
             parent, inspirations = self.database.sample()
 
             # Build prompt
@@ -252,8 +297,17 @@ class OpenEvolve:
                     },
                 )
 
-                # Add to database
+                # Add to database (will be added to current island)
                 self.database.add(child_program, iteration=i + 1)
+
+                # Increment generation for current island
+                self.database.increment_island_generation()
+
+                # Check if migration should occur
+                if self.database.should_migrate():
+                    logger.info(f"Performing migration at iteration {i+1}")
+                    self.database.migrate_programs()
+                    self.database.log_island_status()
 
                 # Log progress
                 iteration_time = time.time() - iteration_start
@@ -264,13 +318,14 @@ class OpenEvolve:
                     logger.info(
                         f"🌟 New best solution found at iteration {i+1}: {child_program.id}"
                     )
-                    logger.info(
-                        f"Metrics: {', '.join(f'{name}={value:.4f}' for name, value in child_program.metrics.items())}"
-                    )
+                    logger.info(f"Metrics: {format_metrics_safe(child_program.metrics)}")
 
                 # Save checkpoint
                 if (i + 1) % self.config.checkpoint_interval == 0:
                     self._save_checkpoint(i + 1)
+                    # Also log island status at checkpoints
+                    logger.info(f"Island status at checkpoint {i+1}:")
+                    self.database.log_island_status()
 
                 # Check if target score reached
                 if target_score is not None:
@@ -318,7 +373,7 @@ class OpenEvolve:
         if best_program:
             logger.info(
                 f"Evolution complete. Best program has metrics: "
-                f"{', '.join(f'{name}={value:.4f}' for name, value in best_program.metrics.items())}"
+                f"{format_metrics_safe(best_program.metrics)}"
             )
 
             # Save the best program (using our tracked best program)
@@ -346,19 +401,13 @@ class OpenEvolve:
             child: Child program
             elapsed_time: Elapsed time in seconds
         """
-        # Calculate improvement
-        improvement = {}
-        for metric, value in child.metrics.items():
-            if metric in parent.metrics:
-                diff = value - parent.metrics[metric]
-                improvement[metric] = diff
-
-        improvement_str = ", ".join(f"{name}={diff:+.4f}" for name, diff in improvement.items())
+        # Calculate improvement using safe formatting
+        improvement_str = format_improvement_safe(parent.metrics, child.metrics)
 
         logger.info(
             f"Iteration {iteration+1}: Child {child.id} from parent {parent.id} "
             f"in {elapsed_time:.2f}s. Metrics: "
-            f"{', '.join(f'{name}={value:.4f}' for name, value in child.metrics.items())} "
+            f"{format_metrics_safe(child.metrics)} "
             f"(Δ: {improvement_str})"
         )
 
@@ -414,7 +463,7 @@ class OpenEvolve:
 
             logger.info(
                 f"Saved best program at checkpoint {iteration} with metrics: "
-                f"{', '.join(f'{name}={value:.4f}' for name, value in best_program.metrics.items())}"
+                f"{format_metrics_safe(best_program.metrics)}"
             )
 
         logger.info(f"Saved checkpoint at iteration {iteration} to {checkpoint_path}")

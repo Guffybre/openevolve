@@ -17,6 +17,7 @@ dependencies = [
     "pyyaml>=6.0",
     "numpy>=1.22.0",
     "tqdm>=4.64.0",
+    "flask",
 ]
 
 [project.optional-dependencies]
@@ -42,3 +43,6 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
+
+[project.scripts]
+openevolve-run = "openevolve.cli:main"

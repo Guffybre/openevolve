@@ -33,7 +33,7 @@ install: venv
 # Run Black code formatting
 .PHONY: lint
 lint: venv
-	$(PYTHON) -m black openevolve examples tests
+	$(PYTHON) -m black openevolve examples tests scripts
 
 # Run tests using the virtual environment
 .PHONY: test
@@ -48,4 +48,9 @@ docker-build:
 # Run the Docker container with the example
 .PHONY: docker-run
 docker-run:
-	docker run --rm -v $(PROJECT_DIR):/app $(DOCKER_IMAGE) examples/function_minimization/initial_program.py examples/function_minimization/evaluator.py --config examples/function_minimization/config.yaml --iterations 1000
+	docker run --rm -v $(PROJECT_DIR):/app --network="host" $(DOCKER_IMAGE) examples/function_minimization/initial_program.py examples/function_minimization/evaluator.py --config examples/function_minimization/config.yaml --iterations 1000
+
+# Run the visualization script
+.PHONY: visualizer
+visualizer:
+	$(PYTHON) scripts/visualizer.py --path examples/
